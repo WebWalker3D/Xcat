@@ -1,9 +1,3 @@
-Absolutely — here’s an **updated `README.md`** reflecting **xcat 1.0.0-dev** with all the new flags, behavior, and features.
-It’s rewritten for clarity and polished for GitHub (proper tables, emoji section headers, and examples).
-
----
-
-````markdown
 # xcat
 
 `xcat` is a feature-packed, dependency-light Bash utility that **copies files, stdin, or directory contents to your clipboard** — with optional line ranges, preview, compression, verification, and backend autodetection.  
