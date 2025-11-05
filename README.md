@@ -1,8 +1,14 @@
+Absolutely — here’s an **updated `README.md`** reflecting **xcat 1.0.0-dev** with all the new flags, behavior, and features.
+It’s rewritten for clarity and polished for GitHub (proper tables, emoji section headers, and examples).
+
+---
+
+````markdown
 # xcat
 
-`xcat` is a tiny shell helper that **cats a file (or stdin) and copies it to your clipboard**, with optional line-range selection and **auto-install** of a clipboard tool on most Linux distros.
+`xcat` is a feature-packed, dependency-light Bash utility that **copies files, stdin, or directory contents to your clipboard** — with optional line ranges, preview, compression, verification, and backend autodetection.  
 
-It’s meant for those “show me the exact lines you’re talking about” moments — logs, snippets, configs, code blocks, you name it.
+It’s made for those “show me the exact lines you’re talking about” moments: logs, snippets, configs, or code blocks — with safety, style, and speed.  
 
 ---
 
@@ -24,46 +30,51 @@ It’s meant for those “show me the exact lines you’re talking about” mome
   - `apt-get`, `dnf`, `yum`, `pacman`, `zypper`, or `brew`
 - 🧱 **Directory mode**:
   - Non-recursive  
-  - Concatenates all regular files  
+  - Concatenates all regular text files  
+  - Supports `--types=ext1,ext2` filters  
   - Prefixes each chunk with its full path
-- 🛡️ **Safe defaults**:
-  - `set -euo pipefail`
-  - Validates numeric options
-  - Clear error messages when something’s wrong
+- 🧠 **Advanced options**:
+  - `--preview` — syntax-highlight preview (with `bat` or `batcat`)  
+  - `--verify` — show clipboard contents after copy  
+  - `--compress` — gzip + base64 encode payloads before copying  
+  - `--tee` — print and copy simultaneously  
+  - `--backend=NAME` — override autodetection  
+  - `--list-backends` — show available backends  
+  - `--quiet` / `--verbose` — control output  
+  - `--version` — print version info  
+- 🛡️ **Safety features**:
+  - Detects and refuses binary input  
+  - Validates numeric options  
+  - Uses `set -euo pipefail`  
+  - Clear, colored messages for feedback
+- 🧮 **Integrity & info**:
+  - Shows SHA-1 checksum of copied payload  
+  - Reports compression and line range info
 
 ---
 
 ## ⚙️ Requirements
 
-- **Bash**
-- One of the following clipboard utilities (installed or installable):
-  - **Linux / BSD:** `xclip` (X11) or `wl-clipboard` (`wl-copy` on Wayland)
-  - **macOS:** `pbcopy` (usually available by default)
-  - **WSL:** `clip.exe` (part of Windows)
+- **Bash ≥ 4.0**
+- One of the following clipboard utilities:
+  - **Linux / BSD:** `xclip` (X11) or `wl-clipboard` (Wayland)
+  - **macOS:** `pbcopy`
+  - **WSL:** `clip.exe`
 
-If none of these are available, `xcat` will try to install `xclip` or `wl-clipboard` using your system package manager.  
-If that fails, it will tell you what to install manually.
+If none are available, `xcat` will attempt to install `xclip` or `wl-clipboard` automatically using your system package manager.  
+If installation fails, it will print manual instructions.
 
 ---
 
 ## 🧩 Installation
 
-Save the script somewhere in your `$PATH`, for example:
-
 ```bash
-# Adjust the source URL/path as needed
-sudo curl -L https://raw.githubusercontent.com/WebWalker3D/Xcat/main/xcat -o /usr/local/bin/xcat
+sudo curl -L https://raw.githubusercontent.com/WebWalker3D/Xcat/main/xcat \
+  -o /usr/local/bin/xcat
 sudo chmod +x /usr/local/bin/xcat
 ````
 
-Or just copy the script contents into a file named `xcat` and make it executable:
-
-```bash
-cp xcat /usr/local/bin/xcat
-chmod +x /usr/local/bin/xcat
-```
-
-Verify it’s available:
+Verify it’s working:
 
 ```bash
 xcat -h
@@ -78,26 +89,37 @@ You should see the usage help.
 ### **Synopsis**
 
 ```bash
-xcat [-s START] [-e END] [-L START:END] [FILE]
+xcat [OPTIONS] [FILE]
 ```
 
 * If `FILE` is omitted, `xcat` reads from **stdin**.
-* If `FILE` is a **directory**, `xcat` will:
+* If `FILE` is a **directory**, it:
 
-  * Concatenate all regular files in that directory (non-recursively),
-  * Prefix each file’s content with its full path,
-  * Send the combined output to your clipboard.
+  * Concatenates all regular text files (non-recursively)
+  * Optionally filters by extension via `--types=`
+  * Prefixes each section with its full path
+  * Sends the combined output to your clipboard
 
 ---
 
 ### **Options**
 
-| Option         | Description                                                 |
-| :------------- | :---------------------------------------------------------- |
-| `-s START`     | 1-based start line (inclusive)                              |
-| `-e END`       | 1-based end line (inclusive)                                |
-| `-L START:END` | Shorthand for a line range (`-L 10:20`, `-L 15:`, `-L :50`) |
-| `-h`           | Show help and exit                                          |
+| Option              | Description                                                  |
+| :------------------ | :----------------------------------------------------------- |
+| `-s START`          | 1-based start line (inclusive)                               |
+| `-e END`            | 1-based end line (inclusive)                                 |
+| `-L A:B`            | Shorthand line range (`-L 10:20`, `-L 15:`, `-L :50`)        |
+| `-p`, `--preview`   | Show syntax-highlighted preview (requires `bat` or `batcat`) |
+| `--verify`          | Print first 10 lines of clipboard after copying              |
+| `--compress`        | gzip + base64 encode payload before copying                  |
+| `--tee`             | Print output to stdout and clipboard simultaneously          |
+| `--backend=NAME`    | Force backend (`xclip`, `wl-copy`, `pbcopy`, `clip.exe`)     |
+| `--types=ext1,ext2` | Limit directory mode to specific file types                  |
+| `--list-backends`   | Show available clipboard backends and exit                   |
+| `-q`, `--quiet`     | Suppress non-error output                                    |
+| `-v`, `--verbose`   | Show backend and diagnostic info                             |
+| `-V`, `--version`   | Print version info and exit                                  |
+| `-h`, `--help`      | Show usage help and exit                                     |
 
 Numeric options are validated; `START` and `END` must be positive integers, and `END` cannot be less than `START`.
 
@@ -105,91 +127,126 @@ Numeric options are validated; `START` and `END` must be positive integers, and 
 
 ## 🧪 Examples
 
-### Copy a whole file to clipboard
+### Copy a whole file
 
 ```bash
 xcat ~/.bashrc
 ```
 
-### Copy a specific line range from a file
+### Copy specific line ranges
 
 ```bash
 xcat -s 10 -e 30 app.log
-# or
-xcat -L 10:30 app.log
-```
-
-### Copy from a given line to the end of a file
-
-```bash
 xcat -L 15: app.log
-```
-
-### Copy the first N lines of a file
-
-```bash
 xcat -L :50 app.log
 ```
 
-### Copy from piped input
+### Copy from stdin (e.g. pipeline)
 
 ```bash
 grep ERROR app.log | xcat -L :50
 kubectl get pods -A | xcat
 ```
 
-### Copy all files in a directory
+### Copy all text files in a directory
 
 ```bash
 xcat /etc/apache2/sites-available/
 ```
 
-Apply a line range to the combined stream:
+Filter by extension:
 
 ```bash
-xcat -L :200 /etc/apache2/sites-available/
+xcat /etc --types=conf,service
 ```
 
-> **Note:** Directory mode is non-recursive and only reads regular files in that directory.
-> If there are no regular files, you’ll get an error.
+### Use preview and verify modes
+
+```bash
+xcat -p --verify app.log
+```
+
+### Compress output before copying
+
+```bash
+xcat --compress large.txt
+```
+
+### Override clipboard backend
+
+```bash
+xcat --backend=wl-copy myfile.txt
+```
+
+### Tee output to both clipboard and stdout
+
+```bash
+xcat --tee script.sh | wc -l
+```
+
+### List available backends
+
+```bash
+xcat --list-backends
+```
 
 ---
 
 ## 🧠 Clipboard Detection & Auto-Install
 
-On first run, `xcat` tries to find a suitable clipboard command in this order:
+On first run, `xcat` tries the following in order:
 
 1. `xclip -selection clipboard`
 2. `wl-copy`
 3. `pbcopy`
 4. `clip.exe`
 
-If none are available, it:
+If none are available:
 
-1. Checks if you’re on **Wayland** or **X11** and attempts to install:
+* Detects **Wayland** vs **X11**
+* Attempts to install the matching tool via your package manager:
 
-   * `wl-clipboard` (Wayland)
-   * `xclip` (X11)
-2. Uses your system package manager if found:
+  * `wl-clipboard` (for Wayland)
+  * `xclip` (for X11)
+* Supported managers: `apt-get`, `dnf`, `yum`, `pacman`, `zypper`, `brew`
 
-   * `apt-get`, `dnf`, `yum`, `pacman`, `zypper`, or `brew`
-
-If it still can’t find a working clipboard tool, it prints a helpful message with manual install commands and exits.
+If all fail, `xcat` prints clear manual install instructions.
 
 ---
 
 ## 🚪 Exit Codes
 
-| Code | Meaning                                                      |
-| :--: | :----------------------------------------------------------- |
-|  `0` | Success                                                      |
-|  `1` | Runtime failure (e.g., file not found, no clipboard backend) |
-|  `2` | Invalid usage (bad options, non-numeric values, etc.)        |
+| Code | Meaning                                                     |
+| :--: | :---------------------------------------------------------- |
+|  `0` | Success                                                     |
+|  `1` | Runtime failure (e.g. file not found, no clipboard backend) |
+|  `2` | Invalid usage (bad options, non-numeric values, etc.)       |
+
+---
+
+## 🧩 Version & Integrity Info
+
+Each successful copy displays:
+
+* SHA-1 checksum of the payload
+* Optional compression and range info
+* Active clipboard backend (in verbose mode)
 
 ---
 
 ## 💬 Notes & Tips
 
-* Works great with `grep`, `rg`, `sed`, `awk`, etc., to quickly share snippets.
-* Plays well over SSH with X11 forwarding or WSL clipboard bridges.  (Original use case was copying text files over SSH)
-* Directory mode is handy for collecting multiple small config files in one go.
+* Works beautifully with `grep`, `rg`, `sed`, `awk`, etc.
+* Great over SSH with X11 forwarding or WSL clipboard bridges. (Original use case was copying text files over SSH)
+* Safe with binary detection — won’t copy executables accidentally.
+* Directory mode + `--types` is handy for aggregating config files.
+* Combine with `fzf` or `bat` for interactive snippet sharing.
+* Designed to be portable, predictable, and copy-ready anywhere.
+
+---
+
+## 🧾 License
+
+**MIT License**
+© 2025 Blaine Bouvier (@WebWalker3D)
+See [`LICENSE`](LICENSE) for full text.
