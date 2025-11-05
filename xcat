@@ -1,5 +1,47 @@
 #!/usr/bin/env bash
-# xcat — cat a file or stdin (optionally a line range) and copy to clipboard (with auto-install)
+# ==============================================================================
+#  xcat — universal clipboard helper for files, stdin, and directories
+# ==============================================================================
+#
+#  Author:  Blaine Bouvier (@WebWalker3D)
+#  License: MIT
+#  Repo:    https://github.com/WebWalker3D/Xcat
+#
+#  Description:
+#    xcat is a tiny, dependency-light shell utility that prints the contents of
+#    a file, stdin, or all regular files in a directory — then copies the result
+#    to your system clipboard.  It supports optional line-range selection and
+#    automatic installation of clipboard tools (xclip, wl-clipboard, pbcopy,
+#    or clip.exe) on most Linux and BSD systems.
+#
+#  Key Features:
+#    • Copy to clipboard from a file, stdin, or directory (non-recursive)
+#    • Select line ranges via -s/-e or -L START:END
+#    • Automatically detect and install a clipboard backend
+#    • Safely handle stdin with a temporary buffer
+#    • Binary-safe guard: skips or refuses non-text files
+#    • Designed for quick sharing of log snippets, configs, or code
+#
+#  Example Usage:
+#    xcat ~/.bashrc                   # copy entire file
+#    xcat -L 10:30 app.log            # copy specific lines
+#    grep ERROR app.log | xcat        # copy grep output
+#    xcat /etc/apache2/sites-available/  # copy all text files in dir
+#
+#  Exit Codes:
+#    0  Success
+#    1  Runtime error (missing file, no clipboard backend, etc.)
+#    2  Invalid usage (bad options, malformed arguments)
+#
+#  Dependencies:
+#    • bash (≥ 4.0)
+#    • One of: xclip, wl-copy, pbcopy, clip.exe
+#
+#  Installation (one-liner):
+#    sudo curl -L https://raw.githubusercontent.com/WebWalker3D/Xcat/main/xcat \
+#      -o /usr/local/bin/xcat && sudo chmod +x /usr/local/bin/xcat
+#
+# ==============================================================================
 
 set -euo pipefail
 
@@ -94,6 +136,13 @@ select_clip_cmd() {
 
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
+is_text_file() {
+  # Returns 0 if the file *looks* like text, non-zero if binary or unreadable.
+  local f=$1
+  [ -r "$f" ] || return 1
+  LC_ALL=C grep -Iq . "$f"
+}
+
 # --- parse options ---------------------------------------------------------
 
 start_line=""
@@ -156,7 +205,7 @@ if [ -n "$start_line" ] || [ -n "$end_line" ]; then
   filter_cmd=(sed $sed_args)
 fi
 
-# Helper: concatenate all regular files in a directory (non-recursive),
+# Helper: concatenate all regular text files in a directory (non-recursive),
 # prefixing each chunk with its full path.
 dir_to_stream() {
   local dir="$1"
@@ -175,28 +224,49 @@ dir_to_stream() {
     return 1
   fi
 
+  local any_text=0
   for f in "${files[@]}"; do
+    if ! is_text_file "$f"; then
+      echo "xcat: skipping non-text file: $f" >&2
+      continue
+    fi
+    any_text=1
     printf '%s\n' "$f"
     cat -- "$f"
     printf '\n'
   done
+
+  if [ "$any_text" -eq 0 ]; then
+    echo "xcat: no text files in directory: $dir" >&2
+    return 1
+  fi
 }
 
 if [ $# -eq 0 ]; then
-  # stdin → clipboard
-  if [ "${filter_cmd[0]}" = "cat" ]; then
-    # shellcheck disable=SC2086
-    $CLIP_CMD
-  else
-    "${filter_cmd[@]}" | $CLIP_CMD
+  # stdin → temp file → clipboard (with binary guard)
+  tmp=$(mktemp "${TMPDIR:-/tmp}/xcat.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT
+
+  cat > "$tmp"
+
+  if ! is_text_file "$tmp"; then
+    echo "xcat: refusing to operate on non-text stdin." >&2
+    exit 1
   fi
+
+  if [ "${filter_cmd[0]}" = "cat" ]; then
+    cat "$tmp" | $CLIP_CMD
+  else
+    "${filter_cmd[@]}" < "$tmp" | $CLIP_CMD
+  fi
+
   range_msg=""
   [ -n "${start_line:-}" ] || [ -n "${end_line:-}" ] && range_msg=" (selected lines)"
   echo "📋 Input from stdin copied to clipboard${range_msg}."
 else
   path="$1"
 
-  # --- NEW: directory handling ---------------------------------------------
+  # Directory handling
   if [ -d "$path" ]; then
     if [ "${filter_cmd[0]}" = "cat" ]; then
       dir_to_stream "$path" | $CLIP_CMD
@@ -213,13 +283,18 @@ else
       range_msg=" (lines 1-${end_line})"
     fi
 
-    echo "📋 All regular files in directory '$path' copied to clipboard${range_msg}."
+    echo "📋 All regular text files in directory '$path' copied to clipboard${range_msg}."
     exit 0
   fi
-  # -------------------------------------------------------------------------
 
+  # Regular file
   if [ ! -f "$path" ]; then
     echo "xcat: file not found: $path" >&2
+    exit 1
+  fi
+
+  if ! is_text_file "$path"; then
+    echo "xcat: refusing to operate on non-text file: $path" >&2
     exit 1
   fi
 
@@ -238,3 +313,4 @@ else
     fi
   fi
 fi
+
