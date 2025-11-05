@@ -19,14 +19,15 @@
 #    • Select line ranges via -s/-e or -L START:END
 #    • Automatically detect and install a clipboard backend
 #    • Safely handle stdin with a temporary buffer
-#    • Binary-safe guard: skips or refuses non-text files
-#    • Designed for quick sharing of log snippets, configs, or code
+#    • Binary-safe guard: refuses or skips non-text data
+#    • Optional preview, verification, compression, and checksum output
+#    • Tee mode: print and copy simultaneously
 #
 #  Example Usage:
-#    xcat ~/.bashrc                   # copy entire file
-#    xcat -L 10:30 app.log            # copy specific lines
-#    grep ERROR app.log | xcat        # copy grep output
-#    xcat /etc/apache2/sites-available/  # copy all text files in dir
+#    xcat ~/.bashrc                       # copy entire file
+#    xcat -L 10:30 app.log                # copy specific lines
+#    grep ERROR app.log | xcat            # copy grep output
+#    xcat /etc/apache2/sites-available/   # copy all text files in dir
 #
 #  Exit Codes:
 #    0  Success
@@ -44,6 +45,32 @@
 # ==============================================================================
 
 set -euo pipefail
+
+VERSION="1.0.0-dev"
+
+# --- globals / flags --------------------------------------------------------
+
+start_line=""
+end_line=""
+
+QUIET=0
+VERBOSE=0
+PREVIEW=0
+VERIFY=0
+COMPRESS=0
+TEE_MODE=0
+LIST_BACKENDS_ONLY=0
+VERSION_ONLY=0
+
+BACKEND_OVERRIDE=""
+TYPE_FILTER=()
+
+CLIP_CMD=()
+CLIP_READ_CMD=()
+DETECTED_BACKEND=""
+
+INPUT_KIND=""    # "stdin" | "file" | "dir"
+INPUT_SOURCE=""  # path or empty for stdin
 
 # --- helpers ---------------------------------------------------------------
 
@@ -65,7 +92,8 @@ try_install() {
     return 1
   fi
 
-  echo "xcat: attempting to install $target using $pm (may require sudo)..." >&2
+  [ "$QUIET" -eq 0 ] && echo "xcat: attempting to install $target using $pm (may require sudo)..." >&2
+
   case "$pm" in
     apt-get)
       sudo apt-get update -y && sudo apt-get install -y "$target"
@@ -86,52 +114,48 @@ try_install() {
 
 usage() {
   cat <<'EOF'
-Usage: xcat [-s START] [-e END] [-L START:END] [FILE]
+Usage: xcat [OPTIONS] [FILE]
 
 Copy file (or stdin) to clipboard. Optionally restrict to a line range.
-  -s START     1-based start line (inclusive)
-  -e END       1-based end line (inclusive)
-  -L A:B       Shorthand for range; either side may be empty (e.g., :50 or 15:)
+
+Options:
+  -s START         1-based start line (inclusive)
+  -e END           1-based end line (inclusive)
+  -L A:B           Shorthand for range; either side may be empty (e.g., :50 or 15:)
+  -p, --preview    Preview the final payload to stdout (syntax highlighted if possible)
+  -q, --quiet      Suppress non-error messages
+  -v, --verbose    Print extra diagnostic information
+  -V, --version    Show version and exit
+      --verify     Read back from clipboard (if supported) and show a short preview
+      --compress   gzip + base64-encode payload before copying
+      --tee        Print payload to stdout as well as copy to clipboard
+      --backend=NAME
+                    Force backend: xclip | wl-copy | pbcopy | clip.exe
+      --types=EXTS Limit directory mode to given extensions (comma-separated, e.g. conf,service,txt)
+      --list-backends
+                    Show available clipboard backends and exit
+  -h, --help       Show this help and exit
+
+If FILE is omitted, xcat reads from stdin.
+
+If FILE is a directory, xcat will:
+  • Concatenate all regular *text* files in that directory (non-recursively),
+  • Optionally filter by extension via --types,
+  • Prefix each file’s content with its full path,
+  • Send the combined output to your clipboard.
+
 Examples:
   xcat file.txt                       # whole file
   xcat -s 10 -e 30 file.txt           # lines 10..30
   xcat -L 15: file.txt                # lines 15..end
   grep ERROR app.log | xcat -L :50    # first 50 lines of piped input
-  xcat /etc/apache2/sites-available/  # all files in that directory
+  xcat /etc/apache2/sites-available/  # all text files in that directory
+
 EOF
 }
 
-select_clip_cmd() {
-  # Decide which clipboard command to use, installing if needed.
-  # Prefers xclip on X11, wl-copy on Wayland, pbcopy on macOS, clip.exe on WSL.
-
-  # Already available?
-  if have xclip; then echo "xclip -selection clipboard"; return 0; fi
-  if have wl-copy; then echo "wl-copy"; return 0; fi
-  if have pbcopy; then echo "pbcopy"; return 0; fi
-  if have clip.exe; then echo "clip.exe"; return 0; fi
-
-  # Try to infer environment
-  if [ -n "${WAYLAND_DISPLAY-}" ]; then
-    if try_install wl-clipboard && have wl-copy; then echo "wl-copy"; return 0; fi
-    if try_install xclip && have xclip; then echo "xclip -selection clipboard"; return 0; fi
-  elif [ -n "${DISPLAY-}" ]; then
-    if try_install xclip && have xclip; then echo "xclip -selection clipboard"; return 0; fi
-    if try_install wl-clipboard && have wl-copy; then echo "wl-copy"; return 0; fi
-  fi
-
-  # macOS attempt (brew)
-  if [ "$(uname -s)" = "Darwin" ] && have brew; then
-    # pbcopy is part of macOS; this is mostly for odd PATHs
-    if have pbcopy; then echo "pbcopy"; return 0; fi
-  fi
-
-  # WSL fallback
-  if grep -qi microsoft /proc/version 2>/dev/null; then
-    if have clip.exe; then echo "clip.exe"; return 0; fi
-  fi
-
-  return 1
+version() {
+  echo "xcat ${VERSION}"
 }
 
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
@@ -143,71 +167,200 @@ is_text_file() {
   LC_ALL=C grep -Iq . "$f"
 }
 
-# --- parse options ---------------------------------------------------------
-
-start_line=""
-end_line=""
-while getopts ":s:e:L:h" opt; do
-  case "$opt" in
-    s) start_line="$OPTARG" ;;
-    e) end_line="$OPTARG" ;;
-    L)
-      IFS=':' read -r LHS RHS <<<"$OPTARG"
-      [ -n "${LHS:-}" ] && start_line="$LHS"
-      [ -n "${RHS:-}" ] && end_line="$RHS"
-      ;;
-    h) usage; exit 0 ;;
-    \?) echo "xcat: invalid option -- -$OPTARG" >&2; usage; exit 2 ;;
-    :) echo "xcat: option -$OPTARG requires an argument" >&2; usage; exit 2 ;;
-  esac
-done
-shift $((OPTIND-1))
-
-# Validate numeric inputs if present
-if [ -n "$start_line" ] && ! is_uint "$start_line"; then
-  echo "xcat: START must be a positive integer." >&2; exit 2
-fi
-if [ -n "$end_line" ] && ! is_uint "$end_line"; then
-  echo "xcat: END must be a positive integer." >&2; exit 2
-fi
-if [ -n "$start_line" ] && [ -n "$end_line" ] && [ "$end_line" -lt "$start_line" ]; then
-  echo "xcat: END ($end_line) is less than START ($start_line)." >&2; exit 2
-fi
-
-# --- main ------------------------------------------------------------------
-
-# Resolve clipboard command
-if ! CLIP_CMD=$(select_clip_cmd); then
-  cat >&2 <<'EOF'
-xcat: could not find or install a compatible clipboard tool.
-Tried: xclip (X11), wl-copy (Wayland), pbcopy (macOS), clip.exe (WSL).
-Please install one of them and re-run.
-  - Debian/Ubuntu:  sudo apt-get install xclip    # or wl-clipboard on Wayland
-  - Fedora:         sudo dnf install xclip
-  - Arch:           sudo pacman -S xclip
-  - openSUSE:       sudo zypper install xclip
-  - Wayland (any):  sudo apt-get install wl-clipboard
-EOF
-  exit 1
-fi
-
-# Build a filter if a range was specified
-build_sed_range() {
-  local s="${1:-}" e="${2:-}"
-  local start="${s:-1}"
-  local end="${e:-$}"   # $ = EOF in sed
-  echo "-n ${start},${end}p"
+normalize_types() {
+  local raw=$1
+  IFS=',' read -r -a TYPE_FILTER <<<"$raw"
+  local i
+  for i in "${!TYPE_FILTER[@]}"; do
+    local t="${TYPE_FILTER[$i]}"
+    t="${t## }"
+    t="${t%% }"
+    if [[ -n "$t" && "$t" != .* ]]; then
+      TYPE_FILTER[$i]=".$t"
+    else
+      TYPE_FILTER[$i]="$t"
+    fi
+  done
 }
 
-filter_cmd=cat
-if [ -n "$start_line" ] || [ -n "$end_line" ]; then
-  sed_args=$(build_sed_range "${start_line:-}" "${end_line:-}")
-  filter_cmd=(sed $sed_args)
-fi
+match_types() {
+  # Return 0 if no filters or file matches a filter
+  local file=$1
+  if [ "${#TYPE_FILTER[@]}" -eq 0 ]; then
+    return 0
+  fi
+  local ext
+  for ext in "${TYPE_FILTER[@]}"; do
+    [ -z "$ext" ] && continue
+    if [[ "$file" == *"$ext" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
 
-# Helper: concatenate all regular text files in a directory (non-recursive),
-# prefixing each chunk with its full path.
+resolve_clip_cmd() {
+  CLIP_CMD=()
+  CLIP_READ_CMD=()
+  DETECTED_BACKEND=""
+
+  local b
+
+  # If user forced a backend, honor it
+  if [ -n "$BACKEND_OVERRIDE" ]; then
+    b="$BACKEND_OVERRIDE"
+    case "$b" in
+      xclip)
+        if have xclip; then
+          CLIP_CMD=(xclip -selection clipboard)
+          CLIP_READ_CMD=(xclip -selection clipboard -o)
+          DETECTED_BACKEND="xclip"
+          return 0
+        else
+          echo "xcat: requested backend 'xclip' not available." >&2
+          return 1
+        fi
+        ;;
+      wl-copy)
+        if have wl-copy; then
+          CLIP_CMD=(wl-copy)
+          CLIP_READ_CMD=(wl-paste)
+          DETECTED_BACKEND="wl-copy"
+          return 0
+        else
+          echo "xcat: requested backend 'wl-copy' not available." >&2
+          return 1
+        fi
+        ;;
+      pbcopy)
+        if have pbcopy; then
+          CLIP_CMD=(pbcopy)
+          CLIP_READ_CMD=(pbpaste)
+          DETECTED_BACKEND="pbcopy"
+          return 0
+        else
+          echo "xcat: requested backend 'pbcopy' not available." >&2
+          return 1
+        fi
+        ;;
+      clip.exe)
+        if have clip.exe; then
+          CLIP_CMD=(clip.exe)
+          # No easy generic readback for clip.exe; VERIFY will be disabled.
+          CLIP_READ_CMD=()
+          DETECTED_BACKEND="clip.exe"
+          return 0
+        else
+          echo "xcat: requested backend 'clip.exe' not available." >&2
+          return 1
+        fi
+        ;;
+      *)
+        echo "xcat: unknown backend '$b' (valid: xclip, wl-copy, pbcopy, clip.exe)" >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  # Autodetect (with install attempts)
+  if have xclip; then
+    CLIP_CMD=(xclip -selection clipboard)
+    CLIP_READ_CMD=(xclip -selection clipboard -o)
+    DETECTED_BACKEND="xclip"
+    return 0
+  fi
+  if have wl-copy; then
+    CLIP_CMD=(wl-copy)
+    CLIP_READ_CMD=(wl-paste)
+    DETECTED_BACKEND="wl-copy"
+    return 0
+  fi
+  if have pbcopy; then
+    CLIP_CMD=(pbcopy)
+    CLIP_READ_CMD=(pbpaste)
+    DETECTED_BACKEND="pbcopy"
+    return 0
+  fi
+  if have clip.exe; then
+    CLIP_CMD=(clip.exe)
+    CLIP_READ_CMD=()
+    DETECTED_BACKEND="clip.exe"
+    return 0
+  fi
+
+  # Try to infer environment and install
+  if [ -n "${WAYLAND_DISPLAY-}" ]; then
+    if try_install wl-clipboard && have wl-copy; then
+      CLIP_CMD=(wl-copy)
+      CLIP_READ_CMD=(wl-paste)
+      DETECTED_BACKEND="wl-copy"
+      return 0
+    fi
+    if try_install xclip && have xclip; then
+      CLIP_CMD=(xclip -selection clipboard)
+      CLIP_READ_CMD=(xclip -selection clipboard -o)
+      DETECTED_BACKEND="xclip"
+      return 0
+    fi
+  elif [ -n "${DISPLAY-}" ]; then
+    if try_install xclip && have xclip; then
+      CLIP_CMD=(xclip -selection clipboard)
+      CLIP_READ_CMD=(xclip -selection clipboard -o)
+      DETECTED_BACKEND="xclip"
+      return 0
+    fi
+    if try_install wl-clipboard && have wl-copy; then
+      CLIP_CMD=(wl-copy)
+      CLIP_READ_CMD=(wl-paste)
+      DETECTED_BACKEND="wl-copy"
+      return 0
+    fi
+  fi
+
+  # macOS attempt (brew)
+  if [ "$(uname -s)" = "Darwin" ] && have brew; then
+    if have pbcopy; then
+      CLIP_CMD=(pbcopy)
+      CLIP_READ_CMD=(pbpaste)
+      DETECTED_BACKEND="pbcopy"
+      return 0
+    fi
+  fi
+
+  # WSL fallback
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    if have clip.exe; then
+      CLIP_CMD=(clip.exe)
+      CLIP_READ_CMD=()
+      DETECTED_BACKEND="clip.exe"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+list_backends() {
+  echo "Available clipboard backends:"
+  for b in xclip "wl-copy" pbcopy "clip.exe"; do
+    if have "${b%% *}"; then
+      printf "  ✓ %s\n" "$b"
+    else
+      printf "  ✗ %s\n" "$b"
+    fi
+  done
+  if resolve_clip_cmd; then
+    echo
+    echo "Active (if used now): $DETECTED_BACKEND"
+  else
+    echo
+    echo "Active: (none — no backend currently available)"
+  fi
+}
+
 dir_to_stream() {
+  # Concatenate all regular text files in a directory (non-recursive),
+  # prefixing each chunk with its full path.
   local dir="$1"
   local f
   shopt -s nullglob
@@ -226,8 +379,12 @@ dir_to_stream() {
 
   local any_text=0
   for f in "${files[@]}"; do
+    if ! match_types "$f"; then
+      [ "$VERBOSE" -eq 1 ] && echo "xcat: skipping due to type filter: $f" >&2
+      continue
+    fi
     if ! is_text_file "$f"; then
-      echo "xcat: skipping non-text file: $f" >&2
+      [ "$VERBOSE" -eq 1 ] && echo "xcat: skipping non-text file: $f" >&2
       continue
     fi
     any_text=1
@@ -237,80 +394,257 @@ dir_to_stream() {
   done
 
   if [ "$any_text" -eq 0 ]; then
-    echo "xcat: no text files in directory: $dir" >&2
+    echo "xcat: no text files in directory (after filters): $dir" >&2
     return 1
   fi
 }
 
+preview_payload() {
+  local file="$1"
+  [ "$QUIET" -eq 1 ] && return 0
+
+  echo "──── preview ─────────────────────────────────────────────"
+  if have bat; then
+    bat --paging=never "$file"
+  elif have batcat; then
+    batcat --paging=never "$file"
+  else
+    cat "$file"
+  fi
+  echo "──────────────────────────────────────────────────────────"
+}
+
+verify_clipboard() {
+  [ "$VERIFY" -eq 1 ] || return 0
+  [ "$QUIET" -eq 1 ] && return 0
+
+  if [ "${#CLIP_READ_CMD[@]}" -eq 0 ]; then
+    echo "xcat: verification not supported for backend '$DETECTED_BACKEND'." >&2
+    return 0
+  fi
+
+  echo "──── clipboard (verify) ─────────────────────────────────"
+  if ! "${CLIP_READ_CMD[@]}" 2>/dev/null | head -n 10; then
+    echo "(failed to read from clipboard)" >&2
+  fi
+  echo "──────────────────────────────────────────────────────────"
+}
+
+describe_range() {
+  local desc=""
+  if [ -n "${start_line:-}" ] && [ -n "${end_line:-}" ]; then
+    desc="lines ${start_line}-${end_line}"
+  elif [ -n "${start_line:-}" ]; then
+    desc="lines ${start_line}-end"
+  elif [ -n "${end_line:-}" ]; then
+    desc="lines 1-${end_line}"
+  else
+    desc=""
+  fi
+  echo "$desc"
+}
+
+# --- option parsing --------------------------------------------------------
+
+while getopts ":s:e:L:hqvpV-:" opt; do
+  case "$opt" in
+    s) start_line="$OPTARG" ;;
+    e) end_line="$OPTARG" ;;
+    L)
+      IFS=':' read -r LHS RHS <<<"$OPTARG"
+      [ -n "${LHS:-}" ] && start_line="$LHS"
+      [ -n "${RHS:-}" ] && end_line="$RHS"
+      ;;
+    h) usage; exit 0 ;;
+    q) QUIET=1 ;;
+    v) VERBOSE=1 ;;
+    p) PREVIEW=1 ;;
+    V) VERSION_ONLY=1 ;;
+    -)
+      case "$OPTARG" in
+        help) usage; exit 0 ;;
+        preview) PREVIEW=1 ;;
+        quiet) QUIET=1 ;;
+        verbose) VERBOSE=1 ;;
+        version) VERSION_ONLY=1 ;;
+        verify) VERIFY=1 ;;
+        compress) COMPRESS=1 ;;
+        tee) TEE_MODE=1 ;;
+        backend=*)
+          BACKEND_OVERRIDE="${OPTARG#backend=}"
+          ;;
+        types=*)
+          normalize_types "${OPTARG#types=}"
+          ;;
+        list-backends)
+          LIST_BACKENDS_ONLY=1
+          ;;
+        *)
+          echo "xcat: unknown option -- --$OPTARG" >&2
+          usage
+          exit 2
+          ;;
+      esac
+      ;;
+    \?)
+      echo "xcat: invalid option -- -$OPTARG" >&2
+      usage
+      exit 2
+      ;;
+    :)
+      echo "xcat: option -$OPTARG requires an argument" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+shift $((OPTIND-1))
+
+# Handle simple modes
+if [ "$VERSION_ONLY" -eq 1 ]; then
+  version
+  exit 0
+fi
+
+if [ "$LIST_BACKENDS_ONLY" -eq 1 ]; then
+  list_backends
+  exit 0
+fi
+
+# Validate numeric inputs if present
+if [ -n "$start_line" ] && ! is_uint "$start_line"; then
+  echo "xcat: START must be a positive integer." >&2; exit 2
+fi
+if [ -n "$end_line" ] && ! is_uint "$end_line"; then
+  echo "xcat: END must be a positive integer." >&2; exit 2
+fi
+if [ -n "$start_line" ] && [ -n "$end_line" ] && [ "$end_line" -lt "$start_line" ]; then
+  echo "xcat: END ($end_line) is less than START ($start_line)." >&2; exit 2
+fi
+
+# --- main ------------------------------------------------------------------
+
+if ! resolve_clip_cmd; then
+  cat >&2 <<'EOF'
+xcat: could not find or install a compatible clipboard tool.
+Tried: xclip (X11), wl-copy (Wayland), pbcopy (macOS), clip.exe (WSL).
+Please install one of them and re-run.
+  - Debian/Ubuntu:  sudo apt-get install xclip    # or wl-clipboard on Wayland
+  - Fedora:         sudo dnf install xclip
+  - Arch:           sudo pacman -S xclip
+  - openSUSE:       sudo zypper install xclip
+  - Wayland (any):  sudo apt-get install wl-clipboard
+EOF
+  exit 1
+fi
+
+[ "$VERBOSE" -eq 1 ] && [ "$QUIET" -eq 0 ] && echo "xcat: using backend: $DETECTED_BACKEND" >&2
+
+RAW_FILE=$(mktemp "${TMPDIR:-/tmp}/xcat.raw.XXXXXX")
+PAYLOAD_FILE=$(mktemp "${TMPDIR:-/tmp}/xcat.payload.XXXXXX")
+trap 'rm -f "$RAW_FILE" "$PAYLOAD_FILE"' EXIT
+
 if [ $# -eq 0 ]; then
-  # stdin → temp file → clipboard (with binary guard)
-  tmp=$(mktemp "${TMPDIR:-/tmp}/xcat.XXXXXX")
-  trap 'rm -f "$tmp"' EXIT
+  INPUT_KIND="stdin"
+  INPUT_SOURCE=""
 
-  cat > "$tmp"
+  # stdin → RAW
+  cat > "$RAW_FILE"
 
-  if ! is_text_file "$tmp"; then
+  if ! is_text_file "$RAW_FILE"; then
     echo "xcat: refusing to operate on non-text stdin." >&2
     exit 1
   fi
-
-  if [ "${filter_cmd[0]}" = "cat" ]; then
-    cat "$tmp" | $CLIP_CMD
-  else
-    "${filter_cmd[@]}" < "$tmp" | $CLIP_CMD
-  fi
-
-  range_msg=""
-  [ -n "${start_line:-}" ] || [ -n "${end_line:-}" ] && range_msg=" (selected lines)"
-  echo "📋 Input from stdin copied to clipboard${range_msg}."
 else
   path="$1"
+  INPUT_SOURCE="$path"
 
-  # Directory handling
   if [ -d "$path" ]; then
-    if [ "${filter_cmd[0]}" = "cat" ]; then
-      dir_to_stream "$path" | $CLIP_CMD
-    else
-      dir_to_stream "$path" | "${filter_cmd[@]}" | $CLIP_CMD
+    INPUT_KIND="dir"
+    if ! dir_to_stream "$path" > "$RAW_FILE"; then
+      exit 1
     fi
-
-    range_msg=""
-    if [ -n "${start_line:-}" ] && [ -n "${end_line:-}" ]; then
-      range_msg=" (lines ${start_line}-${end_line})"
-    elif [ -n "${start_line:-}" ]; then
-      range_msg=" (lines ${start_line}-end)"
-    elif [ -n "${end_line:-}" ]; then
-      range_msg=" (lines 1-${end_line})"
-    fi
-
-    echo "📋 All regular text files in directory '$path' copied to clipboard${range_msg}."
-    exit 0
-  fi
-
-  # Regular file
-  if [ ! -f "$path" ]; then
-    echo "xcat: file not found: $path" >&2
-    exit 1
-  fi
-
-  if ! is_text_file "$path"; then
-    echo "xcat: refusing to operate on non-text file: $path" >&2
-    exit 1
-  fi
-
-  if [ "${filter_cmd[0]}" = "cat" ]; then
-    cat "$path" | $CLIP_CMD
-    echo "📋 Contents of '$path' copied to clipboard."
   else
-    "${filter_cmd[@]}" -- "$path" | $CLIP_CMD
-    # Pretty range message
-    if [ -n "${start_line:-}" ] && [ -n "${end_line:-}" ]; then
-      echo "📋 Lines ${start_line}-${end_line} of '$path' copied to clipboard."
-    elif [ -n "${start_line:-}" ]; then
-      echo "📋 Lines ${start_line}-end of '$path' copied to clipboard."
-    else
-      echo "📋 Lines 1-${end_line} of '$path' copied to clipboard."
+    INPUT_KIND="file"
+    if [ ! -f "$path" ]; then
+      echo "xcat: file not found: $path" >&2
+      exit 1
     fi
+    if ! is_text_file "$path"; then
+      echo "xcat: refusing to operate on non-text file: $path" >&2
+      exit 1
+    fi
+    cat -- "$path" > "$RAW_FILE"
   fi
+fi
+
+# Apply line-range filter (if any)
+if [ -n "$start_line" ] || [ -n "$end_line" ]; then
+  local_start="${start_line:-1}"
+  local_end="${end_line:-\$}"
+  sed -n "${local_start},${local_end}p" "$RAW_FILE" > "$PAYLOAD_FILE"
+else
+  cp "$RAW_FILE" "$PAYLOAD_FILE"
+fi
+
+RANGE_DESC=$(describe_range)
+
+COMPRESSED_NOTE=""
+if [ "$COMPRESS" -eq 1 ]; then
+  COMP_FILE=$(mktemp "${TMPDIR:-/tmp}/xcat.comp.XXXXXX")
+  gzip -c "$PAYLOAD_FILE" | base64 > "$COMP_FILE"
+  mv "$COMP_FILE" "$PAYLOAD_FILE"
+  COMPRESSED_NOTE=" (gzip+base64 encoded)"
+fi
+
+# Compute checksum (SHA1 of final payload)
+SHA=""
+if have sha1sum; then
+  SHA=$(sha1sum "$PAYLOAD_FILE" | awk '{print $1}')
+elif have shasum; then
+  SHA=$(shasum -a 1 "$PAYLOAD_FILE" | awk '{print $1}')
+fi
+
+# Clipboard + optional tee
+if [ "$TEE_MODE" -eq 1 ]; then
+  # Print to stdout and copy in parallel
+  cat "$PAYLOAD_FILE" | tee >( "${CLIP_CMD[@]}" >/dev/null ) >/dev/null
+else
+  cat "$PAYLOAD_FILE" | "${CLIP_CMD[@]}" >/dev/null
+fi
+
+# Preview (from payload, i.e., after line-range & compression decisions)
+if [ "$PREVIEW" -eq 1 ]; then
+  # If compressed, preview the *decompressed* content if possible
+  if [ "$COMPRESS" -eq 1 ]; then
+    TMP_PREVIEW=$(mktemp "${TMPDIR:-/tmp}/xcat.prev.XXXXXX")
+    if base64 -d "$PAYLOAD_FILE" 2>/dev/null | gunzip 2>/dev/null > "$TMP_PREVIEW"; then
+      preview_payload "$TMP_PREVIEW"
+      rm -f "$TMP_PREVIEW"
+    else
+      # Fallback: show encoded payload
+      preview_payload "$PAYLOAD_FILE"
+    fi
+  else
+    preview_payload "$PAYLOAD_FILE"
+  fi
+fi
+
+# Verify clipboard contents (if supported)
+verify_clipboard
+
+# Final status line
+if [ "$QUIET" -eq 0 ]; then
+  case "$INPUT_KIND" in
+    stdin) what="stdin" ;;
+    file)  what="file '$INPUT_SOURCE'" ;;
+    dir)   what="directory '$INPUT_SOURCE'" ;;
+    *)     what="input" ;;
+  esac
+
+  msg="📋 Copied ${what}${COMPRESSED_NOTE}"
+  [ -n "$RANGE_DESC" ] && msg="${msg} (${RANGE_DESC})"
+  [ -n "$SHA" ] && msg="${msg} [sha1:${SHA}]"
+  echo "$msg."
 fi
 
