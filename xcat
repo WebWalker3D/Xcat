@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# xcat — cat a file or stdin (optionally a line range) and copy to clipboard (with auto-install)
+
+set -euo pipefail
+
+# --- helpers ---------------------------------------------------------------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+detect_pkg_mgr() {
+  for pm in apt-get dnf yum pacman zypper brew; do
+    if have "$pm"; then echo "$pm"; return 0; fi
+  done
+  return 1
+}
+
+try_install() {
+  # $1 = target ("xclip" or "wl-clipboard")
+  local target="$1"
+  local pm
+  if ! pm=$(detect_pkg_mgr); then
+    echo "xcat: no supported package manager found to install $target." >&2
+    return 1
+  fi
+
+  echo "xcat: attempting to install $target using $pm (may require sudo)..." >&2
+  case "$pm" in
+    apt-get)
+      sudo apt-get update -y && sudo apt-get install -y "$target"
+      ;;
+    dnf)    sudo dnf install -y "$target" ;;
+    yum)    sudo yum install -y "$target" ;;
+    pacman) sudo pacman -Sy --noconfirm "$target" ;;
+    zypper) sudo zypper install -y "$target" ;;
+    brew)
+      case "$target" in
+        xclip) sudo -n true 2>/dev/null || true; brew install xclip ;;
+        wl-clipboard) brew install wl-clipboard ;;
+        *) brew install "$target" ;;
+      esac
+      ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+Usage: xcat [-s START] [-e END] [-L START:END] [FILE]
+
+Copy file (or stdin) to clipboard. Optionally restrict to a line range.
+  -s START     1-based start line (inclusive)
+  -e END       1-based end line (inclusive)
+  -L A:B       Shorthand for range; either side may be empty (e.g., :50 or 15:)
+Examples:
+  xcat file.txt                       # whole file
+  xcat -s 10 -e 30 file.txt           # lines 10..30
+  xcat -L 15: file.txt                # lines 15..end
+  grep ERROR app.log | xcat -L :50    # first 50 lines of piped input
+  xcat /etc/apache2/sites-available/  # all files in that directory
+EOF
+}
+
+select_clip_cmd() {
+  # Decide which clipboard command to use, installing if needed.
+  # Prefers xclip on X11, wl-copy on Wayland, pbcopy on macOS, clip.exe on WSL.
+
+  # Already available?
+  if have xclip; then echo "xclip -selection clipboard"; return 0; fi
+  if have wl-copy; then echo "wl-copy"; return 0; fi
+  if have pbcopy; then echo "pbcopy"; return 0; fi
+  if have clip.exe; then echo "clip.exe"; return 0; fi
+
+  # Try to infer environment
+  if [ -n "${WAYLAND_DISPLAY-}" ]; then
+    if try_install wl-clipboard && have wl-copy; then echo "wl-copy"; return 0; fi
+    if try_install xclip && have xclip; then echo "xclip -selection clipboard"; return 0; fi
+  elif [ -n "${DISPLAY-}" ]; then
+    if try_install xclip && have xclip; then echo "xclip -selection clipboard"; return 0; fi
+    if try_install wl-clipboard && have wl-copy; then echo "wl-copy"; return 0; fi
+  fi
+
+  # macOS attempt (brew)
+  if [ "$(uname -s)" = "Darwin" ] && have brew; then
+    # pbcopy is part of macOS; this is mostly for odd PATHs
+    if have pbcopy; then echo "pbcopy"; return 0; fi
+  fi
+
+  # WSL fallback
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    if have clip.exe; then echo "clip.exe"; return 0; fi
+  fi
+
+  return 1
+}
+
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# --- parse options ---------------------------------------------------------
+
+start_line=""
+end_line=""
+while getopts ":s:e:L:h" opt; do
+  case "$opt" in
+    s) start_line="$OPTARG" ;;
+    e) end_line="$OPTARG" ;;
+    L)
+      IFS=':' read -r LHS RHS <<<"$OPTARG"
+      [ -n "${LHS:-}" ] && start_line="$LHS"
+      [ -n "${RHS:-}" ] && end_line="$RHS"
+      ;;
+    h) usage; exit 0 ;;
+    \?) echo "xcat: invalid option -- -$OPTARG" >&2; usage; exit 2 ;;
+    :) echo "xcat: option -$OPTARG requires an argument" >&2; usage; exit 2 ;;
+  esac
+done
+shift $((OPTIND-1))
+
+# Validate numeric inputs if present
+if [ -n "$start_line" ] && ! is_uint "$start_line"; then
+  echo "xcat: START must be a positive integer." >&2; exit 2
+fi
+if [ -n "$end_line" ] && ! is_uint "$end_line"; then
+  echo "xcat: END must be a positive integer." >&2; exit 2
+fi
+if [ -n "$start_line" ] && [ -n "$end_line" ] && [ "$end_line" -lt "$start_line" ]; then
+  echo "xcat: END ($end_line) is less than START ($start_line)." >&2; exit 2
+fi
+
+# --- main ------------------------------------------------------------------
+
+# Resolve clipboard command
+if ! CLIP_CMD=$(select_clip_cmd); then
+  cat >&2 <<'EOF'
+xcat: could not find or install a compatible clipboard tool.
+Tried: xclip (X11), wl-copy (Wayland), pbcopy (macOS), clip.exe (WSL).
+Please install one of them and re-run.
+  - Debian/Ubuntu:  sudo apt-get install xclip    # or wl-clipboard on Wayland
+  - Fedora:         sudo dnf install xclip
+  - Arch:           sudo pacman -S xclip
+  - openSUSE:       sudo zypper install xclip
+  - Wayland (any):  sudo apt-get install wl-clipboard
+EOF
+  exit 1
+fi
+
+# Build a filter if a range was specified
+build_sed_range() {
+  local s="${1:-}" e="${2:-}"
+  local start="${s:-1}"
+  local end="${e:-$}"   # $ = EOF in sed
+  echo "-n ${start},${end}p"
+}
+
+filter_cmd=cat
+if [ -n "$start_line" ] || [ -n "$end_line" ]; then
+  sed_args=$(build_sed_range "${start_line:-}" "${end_line:-}")
+  filter_cmd=(sed $sed_args)
+fi
+
+# Helper: concatenate all regular files in a directory (non-recursive),
+# prefixing each chunk with its full path.
+dir_to_stream() {
+  local dir="$1"
+  local f
+  shopt -s nullglob
+  local entries=( "$dir"/* )
+  shopt -u nullglob
+
+  local files=()
+  for f in "${entries[@]}"; do
+    [ -f "$f" ] && files+=( "$f" )
+  done
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    echo "xcat: no regular files in directory: $dir" >&2
+    return 1
+  fi
+
+  for f in "${files[@]}"; do
+    printf '%s\n' "$f"
+    cat -- "$f"
+    printf '\n'
+  done
+}
+
+if [ $# -eq 0 ]; then
+  # stdin → clipboard
+  if [ "${filter_cmd[0]}" = "cat" ]; then
+    # shellcheck disable=SC2086
+    $CLIP_CMD
+  else
+    "${filter_cmd[@]}" | $CLIP_CMD
+  fi
+  range_msg=""
+  [ -n "${start_line:-}" ] || [ -n "${end_line:-}" ] && range_msg=" (selected lines)"
+  echo "📋 Input from stdin copied to clipboard${range_msg}."
+else
+  path="$1"
+
+  # --- NEW: directory handling ---------------------------------------------
+  if [ -d "$path" ]; then
+    if [ "${filter_cmd[0]}" = "cat" ]; then
+      dir_to_stream "$path" | $CLIP_CMD
+    else
+      dir_to_stream "$path" | "${filter_cmd[@]}" | $CLIP_CMD
+    fi
+
+    range_msg=""
+    if [ -n "${start_line:-}" ] && [ -n "${end_line:-}" ]; then
+      range_msg=" (lines ${start_line}-${end_line})"
+    elif [ -n "${start_line:-}" ]; then
+      range_msg=" (lines ${start_line}-end)"
+    elif [ -n "${end_line:-}" ]; then
+      range_msg=" (lines 1-${end_line})"
+    fi
+
+    echo "📋 All regular files in directory '$path' copied to clipboard${range_msg}."
+    exit 0
+  fi
+  # -------------------------------------------------------------------------
+
+  if [ ! -f "$path" ]; then
+    echo "xcat: file not found: $path" >&2
+    exit 1
+  fi
+
+  if [ "${filter_cmd[0]}" = "cat" ]; then
+    cat "$path" | $CLIP_CMD
+    echo "📋 Contents of '$path' copied to clipboard."
+  else
+    "${filter_cmd[@]}" -- "$path" | $CLIP_CMD
+    # Pretty range message
+    if [ -n "${start_line:-}" ] && [ -n "${end_line:-}" ]; then
+      echo "📋 Lines ${start_line}-${end_line} of '$path' copied to clipboard."
+    elif [ -n "${start_line:-}" ]; then
+      echo "📋 Lines ${start_line}-end of '$path' copied to clipboard."
+    else
+      echo "📋 Lines 1-${end_line} of '$path' copied to clipboard."
+    fi
+  fi
+fi
