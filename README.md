@@ -52,11 +52,8 @@ Save the script somewhere in your `$PATH`, for example:
 
 ```bash
 # Adjust the source URL/path as needed
-cd /tmp
-git clone https://github.com/WebWalker3D/Xcat.git
-cd Xcat
-mv xcat /usr/local/bin
-chmod +x /usr/local/bin/xcat
+sudo curl -L https://raw.githubusercontent.com/WebWalker3D/Xcat/main/xcat -o /usr/local/bin/xcat
+sudo chmod +x /usr/local/bin/xcat
 ````
 
 Or just copy the script contents into a file named `xcat` and make it executable:
