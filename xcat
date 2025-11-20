@@ -72,6 +72,8 @@ DETECTED_BACKEND=""
 INPUT_KIND=""    # "stdin" | "file" | "dir"
 INPUT_SOURCE=""  # path or empty for stdin
 
+LINES_COPIED=""
+
 # --- helpers ---------------------------------------------------------------
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -589,6 +591,11 @@ fi
 
 RANGE_DESC=$(describe_range)
 
+# Count total lines in the (uncompressed) payload
+if have wc; then
+  LINES_COPIED=$(wc -l < "$PAYLOAD_FILE" | awk '{print $1}')
+fi
+
 COMPRESSED_NOTE=""
 if [ "$COMPRESS" -eq 1 ]; then
   COMP_FILE=$(mktemp "${TMPDIR:-/tmp}/xcat.comp.XXXXXX")
@@ -643,7 +650,17 @@ if [ "$QUIET" -eq 0 ]; then
   esac
 
   msg="📋 Copied ${what}${COMPRESSED_NOTE}"
-  [ -n "$RANGE_DESC" ] && msg="${msg} (${RANGE_DESC})"
+
+  if [ -n "$LINES_COPIED" ]; then
+    msg="${msg} (${LINES_COPIED} lines"
+    if [ -n "$RANGE_DESC" ]; then
+      msg="${msg}, ${RANGE_DESC}"
+    fi
+    msg="${msg})"
+  elif [ -n "$RANGE_DESC" ]; then
+    msg="${msg} (${RANGE_DESC})"
+  fi
+
   [ -n "$SHA" ] && msg="${msg} [sha1:${SHA}]"
   echo "$msg."
 fi
